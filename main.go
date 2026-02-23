@@ -24,35 +24,57 @@ import (
 )
 
 var (
-	port     = flag.String("port", "8080", "Port to listen on")
-	caCert   = flag.String("ca-cert", "ca.pem", "Path to CA certificate")
-	caKey    = flag.String("ca-key", "ca.key", "Path to CA private key")
-	dbPath   = flag.String("db", "audit.db", "Path to SQLite database")
-	verbose  = flag.Bool("v", false, "Verbose logging to stdout")
+	port       = flag.String("port", "8080", "Port to listen on")
+	caCert     = flag.String("ca-cert", "ca.pem", "Path to CA certificate")
+	caKey      = flag.String("ca-key", "ca.key", "Path to CA private key")
+	dbPath     = flag.String("db", "audit.db", "Path to SQLite database")
+	configPath = flag.String("config", "policy.yaml", "Path to policy config file")
+	verbose    = flag.Bool("v", false, "Verbose logging to stdout")
 )
+
+type requestMeta struct {
+	logID    int64
+	evaluate bool // true if response needs keyword evaluation
+}
 
 const maxBodySize = 1 << 20 // 1 MB
 
-var db *sql.DB
+var (
+	db      *sql.DB
+	policyCfg *Config
+)
 
 func main() {
 	flag.Parse()
 
-	// 1. Initialize SQLite
+	// 1. Load policy config
+	var err error
+	policyCfg, err = LoadConfig(*configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("No config file at %s, using open policy", *configPath)
+			policyCfg = DefaultConfig()
+		} else {
+			log.Fatalf("Failed to load config: %v", err)
+		}
+	}
+	log.Printf("Policy mode: %s", policyCfg.Policy)
+
+	// 2. Initialize SQLite
 	initDB()
 	defer db.Close()
 
-	// 2. Setup MITM CA
+	// 3. Setup MITM CA
 	setCA(*caCert, *caKey)
 
-	// 3. Configure Proxy
+	// 4. Configure Proxy
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.Verbose = *verbose
 
 	// Intercept all HTTPS traffic
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 
-	// Intercept Requests (The "Reason" Check)
+	// Intercept Requests (The "Reason" + Policy Check)
 	proxy.OnRequest().DoFunc(func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 		reason := r.Header.Get("X-Reason")
@@ -66,32 +88,61 @@ func main() {
 
 		// Log Request
 		logID := logRequest(clientIP, r.Method, r.URL.String(), r.Host, reason, r.Header, bodyBytes)
-		ctx.UserData = logID
+		meta := requestMeta{logID: logID}
+		ctx.UserData = meta
 
-		// Enforce Header
+		// Enforce X-Reason header
 		if reason == "" {
-			// We reject here.
-			// Note: For HTTPS, this happens inside the tunnel.
 			updateAction(logID, "DENY", "Missing X-Reason")
 			return r, goproxy.NewResponse(r,
 				goproxy.ContentTypeText, http.StatusBadRequest,
 				"Proxy Error: Missing required 'X-Reason' header. Explain your intent.")
 		}
 
+		// Apply host policy
+		class := policyCfg.Classify(r.Host)
+		action := policyCfg.Decide(class)
+
+		switch action {
+		case ActionDeny:
+			updateAction(logID, "DENY", fmt.Sprintf("Host %q denied by policy (%s)", r.Host, class))
+			return r, goproxy.NewResponse(r,
+				goproxy.ContentTypeText, http.StatusForbidden,
+				fmt.Sprintf("Proxy Error: Host %q is denied by policy.", r.Host))
+		case ActionEvaluate:
+			meta.evaluate = true
+			ctx.UserData = meta
+		}
+
 		return r, nil
 	})
 
-	// Intercept Responses (Log payload)
+	// Intercept Responses (Log payload + keyword evaluation)
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
-		if ctx.UserData != nil {
-			logID := ctx.UserData.(int64)
-			var bodyBytes []byte
-			if resp.Body != nil {
-				bodyBytes, _ = io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
-				resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-			}
-			logResponse(logID, resp.StatusCode, resp.Header, bodyBytes)
+		if ctx.UserData == nil {
+			return resp
 		}
+		meta := ctx.UserData.(requestMeta)
+
+		var bodyBytes []byte
+		if resp.Body != nil {
+			bodyBytes, _ = io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+			resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		}
+
+		// Keyword evaluation for grey/unlisted hosts
+		if meta.evaluate {
+			passed, keyword := policyCfg.EvaluateResponse(bodyBytes)
+			if !passed {
+				updateAction(meta.logID, "DENY", fmt.Sprintf("Response contains keyword: %q", keyword))
+				logResponse(meta.logID, resp.StatusCode, resp.Header, bodyBytes)
+				return goproxy.NewResponse(ctx.Req,
+					goproxy.ContentTypeText, http.StatusForbidden,
+					fmt.Sprintf("Proxy Error: Response blocked — contains flagged keyword %q.", keyword))
+			}
+		}
+
+		logResponse(meta.logID, resp.StatusCode, resp.Header, bodyBytes)
 		return resp
 	})
 
