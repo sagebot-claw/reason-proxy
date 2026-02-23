@@ -1,179 +1,227 @@
 package main
 
 import (
-	"encoding/json"
+	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"database/sql"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
-	"strings"
 	"time"
-)
 
-// LogEntry structure for structured JSON output
-type LogEntry struct {
-	Time   string `json:"time"`
-	SrcIP  string `json:"src_ip,omitempty"`
-	Method string `json:"method"`
-	URL    string `json:"url"`
-	Reason string `json:"reason,omitempty"`
-	Action string `json:"action"` // "ALLOW" or "DENY"
-	Error  string `json:"error,omitempty"`
-}
+	"github.com/elazarl/goproxy"
+	_ "modernc.org/sqlite"
+)
 
 var (
-	port = flag.String("port", "8080", "Port to listen on")
+	port     = flag.String("port", "8080", "Port to listen on")
+	caCert   = flag.String("ca-cert", "ca.pem", "Path to CA certificate")
+	caKey    = flag.String("ca-key", "ca.key", "Path to CA private key")
+	dbPath   = flag.String("db", "audit.db", "Path to SQLite database")
+	verbose  = flag.Bool("v", false, "Verbose logging to stdout")
 )
+
+var db *sql.DB
 
 func main() {
 	flag.Parse()
 
-	// Logger setup
-	log.SetOutput(os.Stdout)
+	// 1. Initialize SQLite
+	initDB()
+	defer db.Close()
 
-	server := &http.Server{
-		Addr:    ":" + *port,
-		Handler: http.HandlerFunc(handleRequest),
+	// 2. Setup MITM CA
+	setCA(*caCert, *caKey)
+
+	// 3. Configure Proxy
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Verbose = *verbose
+
+	// Intercept all HTTPS traffic
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+
+	// Intercept Requests (The "Reason" Check)
+	proxy.OnRequest().DoFunc(func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+		reason := r.Header.Get("X-Reason")
+
+		// Read Body (Nondestructively)
+		var bodyBytes []byte
+		if r.Body != nil {
+			bodyBytes, _ = io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		}
+
+		// Log Request
+		logID := logRequest(clientIP, r.Method, r.URL.String(), r.Host, reason, r.Header, bodyBytes)
+		ctx.UserData = logID
+
+		// Enforce Header
+		if reason == "" {
+			// We reject here.
+			// Note: For HTTPS, this happens inside the tunnel.
+			updateAction(logID, "DENY", "Missing X-Reason")
+			return r, goproxy.NewResponse(r,
+				goproxy.ContentTypeText, http.StatusBadRequest,
+				"Proxy Error: Missing required 'X-Reason' header. Explain your intent.")
+		}
+
+		return r, nil
+	})
+
+	// Intercept Responses (Log payload)
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		if ctx.UserData != nil {
+			logID := ctx.UserData.(int64)
+			var bodyBytes []byte
+			if resp.Body != nil {
+				bodyBytes, _ = io.ReadAll(resp.Body)
+				resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+			}
+			logResponse(logID, resp.StatusCode, resp.Header, bodyBytes)
+		}
+		return resp
+	})
+
+	log.Printf("Reason Proxy (MITM) started on :%s", *port)
+	log.Fatal(http.ListenAndServe(":"+*port, proxy))
+}
+
+// --- Database Logic ---
+
+func initDB() {
+	var err error
+	db, err = sql.Open("sqlite", *dbPath)
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
 	}
 
-	fmt.Printf("Reason Proxy started on :%s\n", *port)
-	if err := server.ListenAndServe(); err != nil {
+	schema := `
+	CREATE TABLE IF NOT EXISTS audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+		client_ip TEXT,
+		method TEXT,
+		url TEXT,
+		host TEXT,
+		reason TEXT,
+		req_headers TEXT,
+		req_body BLOB,
+		resp_status INTEGER,
+		resp_headers TEXT,
+		resp_body BLOB,
+		action TEXT,
+		error TEXT
+	);
+	`
+	if _, err := db.Exec(schema); err != nil {
+		log.Fatalf("Failed to create schema: %v", err)
+	}
+}
+
+func logRequest(ip, method, url, host, reason string, headers http.Header, body []byte) int64 {
+	// Truncate
+	if len(body) > 4096 { body = body[:4096] }
+	
+	res, err := db.Exec(`
+		INSERT INTO audit_log (client_ip, method, url, host, reason, req_headers, req_body, action)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, ip, method, url, host, reason, fmt.Sprintf("%v", headers), body, "PENDING")
+
+	if err != nil {
+		log.Printf("DB Log Error: %v", err)
+		return 0
+	}
+	id, _ := res.LastInsertId()
+	return id
+}
+
+func logResponse(id int64, status int, headers http.Header, body []byte) {
+	if len(body) > 4096 { body = body[:4096] }
+	
+	_, err := db.Exec(`
+		UPDATE audit_log 
+		SET resp_status = ?, resp_headers = ?, resp_body = ?, action = 'ALLOW'
+		WHERE id = ?
+	`, status, fmt.Sprintf("%v", headers), body, id)
+	
+	if err != nil {
+		log.Printf("DB Update Error: %v", err)
+	}
+}
+
+func updateAction(id int64, action, errorMsg string) {
+	db.Exec("UPDATE audit_log SET action = ?, error = ? WHERE id = ?", action, errorMsg, id)
+}
+
+// --- CA / Certificate Logic ---
+
+func setCA(certFile, keyFile string) {
+	// Check if files exist
+	if _, err := os.Stat(certFile); os.IsNotExist(err) {
+		log.Printf("Generating new CA certificate: %s", certFile)
+		genCA(certFile, keyFile)
+	}
+
+	// Load them into goproxy
+	tlsCert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		log.Fatalf("Failed to load CA: %v", err)
+	}
+	
+	x509Cert, err := x509.ParseCertificate(tlsCert.Certificate[0])
+	if err != nil {
+		log.Fatalf("Failed to parse CA: %v", err)
+	}
+
+	goproxy.GoproxyCa = tlsCert
+	goproxy.OkConnect = &goproxy.ConnectAction{Action: goproxy.ConnectMitm, TLSConfig: goproxy.TLSConfigFromCA(&tlsCert)}
+	goproxy.MitmConnect = &goproxy.ConnectAction{Action: goproxy.ConnectMitm, TLSConfig: goproxy.TLSConfigFromCA(&tlsCert)}
+	goproxy.HTTPMitmConnect = &goproxy.ConnectAction{Action: goproxy.ConnectMitm, TLSConfig: goproxy.TLSConfigFromCA(&tlsCert)}
+	goproxy.RejectConnect = &goproxy.ConnectAction{Action: goproxy.ConnectReject, TLSConfig: goproxy.TLSConfigFromCA(&tlsCert)}
+}
+
+func genCA(certFile, keyFile string) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
 		log.Fatal(err)
 	}
-}
 
-func handleRequest(w http.ResponseWriter, r *http.Request) {
-	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-
-	// 1. Extract Reason
-	reason := r.Header.Get("X-Reason")
-
-	// 2. Validate Reason
-	if reason == "" {
-		logJSON(clientIP, r.Method, r.URL.String(), "", "DENY", "Missing X-Reason header")
-		http.Error(w, "Proxy Error: Missing required 'X-Reason' header. Explain your intent.", http.StatusBadRequest)
-		return
-	}
-
-	// 3. Log Intent (ALLOW)
-	logJSON(clientIP, r.Method, r.URL.String(), reason, "ALLOW", "")
-
-	// 4. Handle Tunnel (CONNECT) vs Standard Proxy
-	if r.Method == http.MethodConnect {
-		handleTunnel(w, r)
-	} else {
-		handleHTTP(w, r)
-	}
-}
-
-func handleTunnel(w http.ResponseWriter, r *http.Request) {
-	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
-	if err != nil {
-		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-		destConn.Close()
-		return
-	}
-	
-	clientConn, _, err := hijacker.Hijack()
-	if err != nil {
-		http.Error(w, "Hijacking failed", http.StatusServiceUnavailable)
-		destConn.Close()
-		return
-	}
-
-	// Send 200 Connection Established to client
-	// Note: We write directly to the connection because we hijacked it
-	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	if err != nil {
-		clientConn.Close()
-		destConn.Close()
-		return
-	}
-
-	// Bidirectional copy
-	go transfer(destConn, clientConn)
-	go transfer(clientConn, destConn)
-}
-
-func handleHTTP(w http.ResponseWriter, r *http.Request) {
-	// Standard HTTP Proxying
-	// Create a new request to the target
-	
-	// r.RequestURI is raw. r.URL is parsed.
-	// For proxy requests, r.URL.Scheme and r.URL.Host should be set.
-	targetURL := r.URL.String()
-	if !strings.HasPrefix(targetURL, "http") {
-		// If it's just a path, it might be a direct request to the proxy (not proxying)
-		// Or it could be malformed. Assume HTTP if scheme missing.
-		targetURL = "http://" + r.Host + r.URL.Path
-	}
-
-	req, err := http.NewRequest(r.Method, targetURL, r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Copy headers
-	for k, vv := range r.Header {
-		if k == "Proxy-Connection" { continue } // Strip hop-by-hop
-		for _, v := range vv {
-			req.Header.Add(k, v)
-		}
-	}
-
-	// Forward Request
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Reason Proxy CA"},
+			CommonName:   "Reason Proxy Root CA",
 		},
-		Timeout: 30 * time.Second,
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().Add(365 * 24 * 10 * time.Hour), // 10 years
+
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
 	}
-	
-	resp, err := client.Do(req)
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
-		return
+		log.Fatal(err)
 	}
-	defer resp.Body.Close()
 
-	// Copy response headers
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	
-	// Copy response body
-	io.Copy(w, resp.Body)
-}
+	certOut, _ := os.Create(certFile)
+	pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	certOut.Close()
 
-func transfer(destination io.WriteCloser, source io.ReadCloser) {
-	defer destination.Close()
-	defer source.Close()
-	io.Copy(destination, source)
-}
-
-func logJSON(src, method, url, reason, action, errorMsg string) {
-	entry := LogEntry{
-		Time:   time.Now().Format(time.RFC3339),
-		SrcIP:  src,
-		Method: method,
-		URL:    url,
-		Reason: reason,
-		Action: action,
-		Error:  errorMsg,
-	}
-	b, _ := json.Marshal(entry)
-	fmt.Println(string(b))
+	keyOut, _ := os.Create(keyFile)
+	pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	keyOut.Close()
 }
