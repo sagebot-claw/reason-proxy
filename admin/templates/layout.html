@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Reason Proxy Admin</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        .log-table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        .log-table th, .log-table td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        .log-table th { background-color: #f2f2f2; }
+        .allow { color: green; }
+        .deny { color: red; }
+        .block { color: orange; }
+    </style>
+</head>
+<body>
+    <nav>
+        <a href="/">Dashboard</a> | <a href="/logs">Audit Logs</a> | <a href="/policy">Policy</a>
+    </nav>
+    <hr>
+    {{template "content" .}}
+</body>
+</html>

@@ -94,6 +94,33 @@ func (d *DB) UpdateAction(id int64, action, errorMsg string) error {
 	return err
 }
 
+func (d *DB) GetStats() (int, int, error) {
+	var allowed, denied int
+	err := d.conn.QueryRow("SELECT COUNT(*) FROM audit_log WHERE action = 'ALLOW'").Scan(&allowed)
+	if err != nil { return 0, 0, err }
+	
+	err = d.conn.QueryRow("SELECT COUNT(*) FROM audit_log WHERE action LIKE 'DENY%' OR action LIKE 'BLOCK%'").Scan(&denied)
+	if err != nil { return 0, 0, err }
+	
+	return allowed, denied, nil
+}
+
+func (d *DB) GetRecentLogs(limit int) ([]LogEntry, error) {
+	rows, err := d.conn.Query("SELECT timestamp, client_ip, method, url, host, reason, action, error FROM audit_log ORDER BY id DESC LIMIT ?", limit)
+	if err != nil { return nil, err }
+	defer rows.Close()
+
+	var logs []LogEntry
+	for rows.Next() {
+		var l LogEntry
+		if err := rows.Scan(&l.Timestamp, &l.ClientIP, &l.Method, &l.URL, &l.Host, &l.Reason, &l.Action, &l.Error); err != nil {
+			continue
+		}
+		logs = append(logs, l)
+	}
+	return logs, nil
+}
+
 func (d *DB) Close() error {
 	return d.conn.Close()
 }

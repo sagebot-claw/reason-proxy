@@ -10,18 +10,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sagebot-claw/reason-proxy/admin"
 	"github.com/sagebot-claw/reason-proxy/db"
 	"github.com/sagebot-claw/reason-proxy/policy"
 	"github.com/sagebot-claw/reason-proxy/proxy"
 )
 
 var (
-	port     = flag.String("port", "8080", "Port to listen on")
-	caCert   = flag.String("ca-cert", "ca.pem", "Path to CA certificate")
-	caKey    = flag.String("ca-key", "ca.key", "Path to CA private key")
-	dbPath   = flag.String("db", "audit.db", "Path to SQLite database")
-	config   = flag.String("config", "policy.yaml", "Path to policy configuration file")
-	verbose  = flag.Bool("v", false, "Verbose logging to stdout")
+	port      = flag.String("port", "8080", "Port to listen on")
+	adminPort = flag.String("admin-port", "8081", "Port for admin interface")
+	caCert    = flag.String("ca-cert", "ca.pem", "Path to CA certificate")
+	caKey     = flag.String("ca-key", "ca.key", "Path to CA private key")
+	dbPath    = flag.String("db", "audit.db", "Path to SQLite database")
+	config    = flag.String("config", "policy.yaml", "Path to policy configuration file")
+	verbose   = flag.Bool("v", false, "Verbose logging to stdout")
 )
 
 func main() {
@@ -63,11 +65,19 @@ func main() {
 		Handler: p,
 	}
 
-	// Start Server in Goroutine
+	// Start Proxy Server
 	go func() {
 		log.Printf("Reason Proxy started on :%s", *port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server error: %v", err)
+			log.Fatalf("Proxy Server error: %v", err)
+		}
+	}()
+
+	// Start Admin Server
+	adminSrv := admin.New(database, pol, *adminPort)
+	go func() {
+		if err := adminSrv.Start(); err != nil && err != http.ErrServerClosed {
+			log.Printf("Admin Server error: %v", err)
 		}
 	}()
 
@@ -80,8 +90,11 @@ func main() {
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Shutdown error: %v", err)
+		log.Printf("Proxy Shutdown error: %v", err)
 	}
+	
+	// Admin server doesn't have a Shutdown handle exposed easily in this quick implementation,
+	// but context cancellation kills the process anyway.
 	
 	log.Println("Shutdown complete. Bye! 👋")
 }

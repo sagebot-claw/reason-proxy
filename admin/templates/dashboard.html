@@ -1,0 +1,43 @@
+{{define "content"}}
+<h1>Dashboard</h1>
+
+<div style="display: flex; gap: 20px; margin-bottom: 20px;">
+    <div style="border: 1px solid #ccc; padding: 15px; border-radius: 5px; flex: 1;">
+        <h3>Policy Mode</h3>
+        <p style="font-size: 1.2em;"><strong>{{.Config.Policy}}</strong></p>
+    </div>
+    <div style="border: 1px solid #ccc; padding: 15px; border-radius: 5px; flex: 1;">
+        <h3>Traffic Stats</h3>
+        <p>Allowed: <span class="allow">{{.Stats.Allowed}}</span></p>
+        <p>Blocked: <span class="deny">{{.Stats.Denied}}</span></p>
+    </div>
+</div>
+
+<h2>Recent Activity</h2>
+<table class="log-table">
+    <thead>
+        <tr>
+            <th>Time</th>
+            <th>Client</th>
+            <th>Method</th>
+            <th>Host</th>
+            <th>Reason</th>
+            <th>Action</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{range .Logs}}
+        <tr>
+            <td>{{.Timestamp}}</td>
+            <td>{{.ClientIP}}</td>
+            <td>{{.Method}}</td>
+            <td>{{.Host}}</td>
+            <td>{{.Reason}}</td>
+            <td class="{{if eq .Action "ALLOW"}}allow{{else}}deny{{end}}">{{.Action}}</td>
+        </tr>
+        {{else}}
+        <tr><td colspan="6">No logs found.</td></tr>
+        {{end}}
+    </tbody>
+</table>
+{{end}}
