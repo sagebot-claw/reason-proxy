@@ -31,6 +31,8 @@ var (
 	verbose  = flag.Bool("v", false, "Verbose logging to stdout")
 )
 
+const maxBodySize = 1 << 20 // 1 MB
+
 var db *sql.DB
 
 func main() {
@@ -58,7 +60,7 @@ func main() {
 		// Read Body (Nondestructively)
 		var bodyBytes []byte
 		if r.Body != nil {
-			bodyBytes, _ = io.ReadAll(r.Body)
+			bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, maxBodySize))
 			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		}
 
@@ -85,7 +87,7 @@ func main() {
 			logID := ctx.UserData.(int64)
 			var bodyBytes []byte
 			if resp.Body != nil {
-				bodyBytes, _ = io.ReadAll(resp.Body)
+				bodyBytes, _ = io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
 				resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 			}
 			logResponse(logID, resp.StatusCode, resp.Header, bodyBytes)
@@ -126,6 +128,15 @@ func initDB() {
 	`
 	if _, err := db.Exec(schema); err != nil {
 		log.Fatalf("Failed to create schema: %v", err)
+	}
+
+	indexes := `
+	CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
+	CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+	CREATE INDEX IF NOT EXISTS idx_audit_host ON audit_log(host);
+	`
+	if _, err := db.Exec(indexes); err != nil {
+		log.Fatalf("Failed to create indexes: %v", err)
 	}
 }
 
@@ -179,8 +190,7 @@ func setCA(certFile, keyFile string) {
 		log.Fatalf("Failed to load CA: %v", err)
 	}
 	
-	x509Cert, err := x509.ParseCertificate(tlsCert.Certificate[0])
-	if err != nil {
+	if _, err := x509.ParseCertificate(tlsCert.Certificate[0]); err != nil {
 		log.Fatalf("Failed to parse CA: %v", err)
 	}
 
@@ -197,8 +207,13 @@ func genCA(certFile, keyFile string) {
 		log.Fatal(err)
 	}
 
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			Organization: []string{"Reason Proxy CA"},
 			CommonName:   "Reason Proxy Root CA",
